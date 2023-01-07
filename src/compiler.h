@@ -840,13 +840,20 @@ __LISTCOMP:
         int patch = emitCode(OP_JUMP_ABSOLUTE);
         getCode()->__exitBlock();
         consume(TK("except"));
-        if(match(TK("@id"))){       // exception name
+        if(match(TK("@id"))){           // exception name
+            emitCode(OP_LOAD_CONST, getCode()->addConst(vm->PyStr(parser->previous.str())));
+            emitCode(OP_EXCEPTION_MATCH);   // if matched, pop TOS
+            int patch = emitCode(OP_POP_JUMP_IF_FALSE);
             compileBlockBody();
+            emitCode(OP_POP_TOP);       // pop the exception
+            // 奇怪，这里应该是2的...居然是1
+            // 我知道了，因为读完字节码立即+1，而绝对跳转覆盖了默认的+1，是正确的
+            // 相对跳转应该考虑+1，绝对跳转不用考虑
+            emitCode(OP_JUMP_RELATIVE, 1);
+            patchJump(patch);
+            emitCode(OP_RE_RAISE);      // no match, re-raise
         }
-        if(match(TK("finally"))){
-            consume(TK(":"));
-            syntaxError("finally is not supported yet");
-        }
+        if(match(TK("finally"))) syntaxError("finally is not supported yet");
         patchJump(patch);
     }
 
@@ -915,9 +922,9 @@ __LISTCOMP:
                 EXPR();
                 consume(TK(")"));
             }else{
-                emitCode(OP_LOAD_NONE); // ...?
+                emitCode(OP_LOAD_NONE);
             }
-            emitCode(OP_RAISE_ERROR);
+            emitCode(OP_RAISE);
             consumeEndStatement();
         } else if(match(TK("del"))){
             EXPR();
@@ -937,8 +944,12 @@ __LISTCOMP:
             // If last op is not an assignment, pop the result.
             uint8_t lastOp = getCode()->co_code.back().op;
             if( lastOp!=OP_STORE_NAME_REF && lastOp!=OP_STORE_REF){
-                if(mode()==SINGLE_MODE && parser->indents.top()==0) emitCode(OP_PRINT_EXPR);
+                if(mode()==SINGLE_MODE && parser->indents.top()==0){
+                    emitCode(OP_PRINT_EXPR);
+                    keepOpcodeLine();
+                }
                 emitCode(OP_POP_TOP);
+                keepOpcodeLine();
             }
         }
     }

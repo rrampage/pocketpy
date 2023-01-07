@@ -50,7 +50,7 @@ struct CodeBlock {
             s += std::to_string(id[i]);
             if(i != id.size()-1) s += "-";
         }
-        s += ": ";
+        s += ", type=";
         s += std::to_string(type);
         s += "]";
         return s;
@@ -180,6 +180,10 @@ public:
         return s_data.size();
     }
 
+    inline auto __debugStackData() const{
+        return s_data;
+    }
+
     inline bool isCodeEnd() const {
         return ip >= code->co_code.size();
     }
@@ -220,6 +224,10 @@ public:
         this->ip = i;
     }
 
+    inline void jumpRelative(int i){
+        this->ip += i;
+    }
+
     void jumpAbsoluteSafe(int target){
         const ByteCode& prev = code->co_code[this->ip];
         int i = prev.block;
@@ -239,6 +247,20 @@ public:
                 "invalid jump from " + code->co_blocks[prev.block].toString() + " to " + code->co_blocks[next.block].toString()
             );
         }
+    }
+
+    bool jumpToNextExceptionHandler(){
+        const ByteCode& curr = code->co_code[this->ip];
+        int i = curr.block;
+        while(i>=0){
+            if(code->co_blocks[i].type == TRY_EXCEPT){
+                // jump to its except block
+                jumpAbsoluteSafe(code->co_blocks[i].end);
+                return true;
+            }
+            i = code->co_blocks[i].parent;
+        }
+        return false;
     }
 
     pkpy::ArgList popNValuesReversed(VM* vm, int n){

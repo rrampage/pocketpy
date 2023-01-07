@@ -25,11 +25,11 @@ class VM {
     std::vector<PyVar> _smallIntegers;      // [-5, 256]
 protected:
     std::deque< pkpy::unique_ptr<Frame> > callstack;
-    PyVarDict _modules;                     // loaded modules
-    emhash8::HashMap<_Str, _Str> _lazyModules;     // lazy loaded modules
+    PyVarDict _modules;                             // loaded modules
+    emhash8::HashMap<_Str, _Str> _lazyModules;      // lazy loaded modules
     PyVar __py2py_call_signal;
     
-    void _checkStopFlag(){
+    inline void _checkStopFlag(){
         if(_stopFlag){
             _stopFlag = false;
             _error("KeyboardInterrupt", "");
@@ -38,306 +38,17 @@ protected:
 
     PyVar runFrame(Frame* frame){
         while(!frame->isCodeEnd()){
-            const ByteCode& byte = frame->readCode();
-            //printf("[%d] %s (%d)\n", frame->stackSize(), OP_NAMES[byte.op], byte.arg);
-            //printf("%s\n", frame->code->src->getLine(byte.line).c_str());
-
-            _checkStopFlag();
-
-            switch (byte.op)
-            {
-            case OP_NO_OP: break;       // do nothing
-            case OP_LOAD_CONST: frame->push(frame->code->co_consts[byte.arg]); break;
-            case OP_LOAD_LAMBDA: {
-                PyVar obj = frame->code->co_consts[byte.arg];
-                setAttr(obj, __module__, frame->_module);
-                frame->push(obj);
-            } break;
-            case OP_LOAD_NAME_REF: {
-                frame->push(PyRef(NameRef(
-                    &(frame->code->co_names[byte.arg])
-                )));
-            } break;
-            case OP_STORE_NAME_REF: {
-                const auto& p = frame->code->co_names[byte.arg];
-                NameRef(&p).set(this, frame, frame->popValue(this));
-            } break;
-            case OP_BUILD_ATTR_REF: {
-                const auto& attr = frame->code->co_names[byte.arg];
-                PyVar obj = frame->popValue(this);
-                frame->push(PyRef(AttrRef(obj, NameRef(&attr))));
-            } break;
-            case OP_BUILD_INDEX_REF: {
-                PyVar index = frame->popValue(this);
-                PyVarRef obj = frame->popValue(this);
-                frame->push(PyRef(IndexRef(obj, index)));
-            } break;
-            case OP_STORE_REF: {
-                PyVar obj = frame->popValue(this);
-                PyVarRef r = frame->__pop();
-                PyRef_AS_C(r)->set(this, frame, std::move(obj));
-            } break;
-            case OP_DELETE_REF: {
-                PyVarRef r = frame->__pop();
-                PyRef_AS_C(r)->del(this, frame);
-            } break;
-            case OP_BUILD_SMART_TUPLE:
-            {
-                pkpy::ArgList items = frame->__popNReversed(byte.arg);
-                bool done = false;
-                for(int i=0; i<items.size(); i++){
-                    if(!items[i]->isType(_tp_ref)) {
-                        done = true;
-                        PyVarList values(items.size());
-                        for(int i=0; i<items.size(); i++){
-                            values[i] = frame->__deref_pointer(this, items[i]);
-                        }
-                        frame->push(PyTuple(values));
-                        break;
-                    }
+            try{
+                PyVarOrNull ret = runStep(frame);
+                if(ret != nullptr) return ret;
+            }catch(const PyRaiseEvent& e){
+                bool ok = frame->jumpToNextExceptionHandler();
+                // There is no exception handler, we should do stack unwinding
+                if(!ok){
+                    PyVar obj = frame->__top();
+                    PyException_AS_C(obj).addSnapshot(frame->errorSnapshot());
+                    throw e;
                 }
-                if(done) break;
-                frame->push(PyRef(TupleRef(items.toList())));
-            } break;
-            case OP_BUILD_STRING:
-            {
-                pkpy::ArgList items = frame->popNValuesReversed(this, byte.arg);
-                _StrStream ss;
-                for(int i=0; i<items.size(); i++) ss << PyStr_AS_C(asStr(items[i]));
-                frame->push(PyStr(ss.str()));
-            } break;
-            case OP_LOAD_EVAL_FN: {
-                frame->push(builtins->attribs[m_eval]);
-            } break;
-            case OP_LIST_APPEND: {
-                pkpy::ArgList args(2);
-                args[1] = frame->popValue(this);            // obj
-                args[0] = frame->__topValueN(this, -2);     // list
-                fastCall(m_append, std::move(args));
-            } break;
-            case OP_STORE_FUNCTION:
-                {
-                    PyVar obj = frame->popValue(this);
-                    const _Func& fn = PyFunction_AS_C(obj);
-                    setAttr(obj, __module__, frame->_module);
-                    frame->f_globals()[fn->name] = obj;
-                } break;
-            case OP_BUILD_CLASS:
-                {
-                    const _Str& clsName = frame->code->co_names[byte.arg].first;
-                    PyVar clsBase = frame->popValue(this);
-                    if(clsBase == None) clsBase = _tp_object;
-                    __checkType(clsBase, _tp_type);
-                    PyVar cls = newUserClassType(frame->_module, clsName, clsBase);
-                    while(true){
-                        PyVar fn = frame->popValue(this);
-                        if(fn == None) break;
-                        const _Func& f = PyFunction_AS_C(fn);
-                        setAttr(fn, __module__, frame->_module);
-                        setAttr(cls, f->name, fn);
-                    }
-                } break;
-            case OP_RETURN_VALUE: return frame->popValue(this);
-            case OP_PRINT_EXPR:
-                {
-                    const PyVar expr = frame->topValue(this);
-                    if(expr == None) break;
-                    *_stdout << PyStr_AS_C(asRepr(expr)) << '\n';
-                } break;
-            case OP_POP_TOP: frame->popValue(this); break;
-            case OP_BINARY_OP:
-                {
-                    frame->push(
-                        fastCall(BINARY_SPECIAL_METHODS[byte.arg],
-                        frame->popNValuesReversed(this, 2))
-                    );
-                } break;
-            case OP_BITWISE_OP:
-                {
-                    frame->push(
-                        fastCall(BITWISE_SPECIAL_METHODS[byte.arg],
-                        frame->popNValuesReversed(this, 2))
-                    );
-                } break;
-            case OP_COMPARE_OP:
-                {
-                    // for __ne__ we use the negation of __eq__
-                    int op = byte.arg == 3 ? 2 : byte.arg;
-                    PyVar res = fastCall(CMP_SPECIAL_METHODS[op], frame->popNValuesReversed(this, 2));
-                    if(op != byte.arg) res = PyBool(!PyBool_AS_C(res));
-                    frame->push(std::move(res));
-                } break;
-            case OP_IS_OP:
-                {
-                    bool ret_c = frame->popValue(this) == frame->popValue(this);
-                    if(byte.arg == 1) ret_c = !ret_c;
-                    frame->push(PyBool(ret_c));
-                } break;
-            case OP_CONTAINS_OP:
-                {
-                    PyVar rhs = frame->popValue(this);
-                    bool ret_c = PyBool_AS_C(call(rhs, __contains__, pkpy::oneArg(frame->popValue(this))));
-                    if(byte.arg == 1) ret_c = !ret_c;
-                    frame->push(PyBool(ret_c));
-                } break;
-            case OP_UNARY_NEGATIVE:
-                {
-                    PyVar obj = frame->popValue(this);
-                    frame->push(numNegated(obj));
-                } break;
-            case OP_UNARY_NOT:
-                {
-                    PyVar obj = frame->popValue(this);
-                    const PyVar& obj_bool = asBool(obj);
-                    frame->push(PyBool(!PyBool_AS_C(obj_bool)));
-                } break;
-            case OP_POP_JUMP_IF_FALSE:
-                if(!PyBool_AS_C(asBool(frame->popValue(this)))) frame->jumpAbsolute(byte.arg);
-                break;
-            case OP_LOAD_NONE: frame->push(None); break;
-            case OP_LOAD_TRUE: frame->push(True); break;
-            case OP_LOAD_FALSE: frame->push(False); break;
-            case OP_LOAD_ELLIPSIS: frame->push(Ellipsis); break;
-            case OP_ASSERT:
-                {
-                    PyVar expr = frame->popValue(this);
-                    _assert(PyBool_AS_C(expr), "assertion failed");
-                } break;
-            case OP_RAISE_ERROR:
-                {
-                    _Str msg = PyStr_AS_C(asRepr(frame->popValue(this)));
-                    _Str type = PyStr_AS_C(frame->popValue(this));
-                    _error(type, msg);
-                } break;
-            case OP_BUILD_LIST:
-                {
-                    frame->push(PyList(
-                        frame->popNValuesReversedUnlimited(this, byte.arg)
-                    ));
-                } break;
-            case OP_BUILD_MAP:
-                {
-                    PyVarList items = frame->popNValuesReversedUnlimited(this, byte.arg*2);
-                    PyVar obj = call(builtins->attribs["dict"]);
-                    for(int i=0; i<items.size(); i+=2){
-                        call(obj, __setitem__, pkpy::twoArgs(items[i], items[i+1]));
-                    }
-                    frame->push(obj);
-                } break;
-            case OP_BUILD_SET:
-                {
-                    PyVar list = PyList(
-                        frame->popNValuesReversedUnlimited(this, byte.arg)
-                    );
-                    PyVar obj = call(builtins->attribs["set"], pkpy::oneArg(list));
-                    frame->push(obj);
-                } break;
-            case OP_DUP_TOP: frame->push(frame->topValue(this)); break;
-            case OP_CALL:
-                {
-                    int ARGC = byte.arg & 0xFFFF;
-                    int KWARGC = (byte.arg >> 16) & 0xFFFF;
-                    pkpy::ArgList kwargs(0);
-                    if(KWARGC > 0) kwargs = frame->popNValuesReversed(this, KWARGC*2);
-                    pkpy::ArgList args = frame->popNValuesReversed(this, ARGC);
-                    PyVar callable = frame->popValue(this);
-                    PyVar ret = call(callable, std::move(args), kwargs, true);
-                    if(ret == __py2py_call_signal) return ret;
-                    frame->push(std::move(ret));
-                } break;
-            case OP_JUMP_ABSOLUTE: frame->jumpAbsolute(byte.arg); break;
-            case OP_SAFE_JUMP_ABSOLUTE: frame->jumpAbsoluteSafe(byte.arg); break;
-            case OP_GOTO: {
-                PyVar obj = frame->popValue(this);
-                const _Str& label = PyStr_AS_C(obj);
-                int* target = frame->code->co_labels.try_get(label);
-                if(target == nullptr){
-                    _error("KeyError", "label '" + label + "' not found");
-                }
-                frame->jumpAbsoluteSafe(*target);
-            } break;
-            case OP_GET_ITER:
-                {
-                    PyVar obj = frame->popValue(this);
-                    PyVarOrNull iter_fn = getAttr(obj, __iter__, false);
-                    if(iter_fn != nullptr){
-                        PyVar tmp = call(iter_fn);
-                        PyVarRef var = frame->__pop();
-                        __checkType(var, _tp_ref);
-                        PyIter_AS_C(tmp)->var = var;
-                        frame->push(std::move(tmp));
-                    }else{
-                        typeError("'" + UNION_TP_NAME(obj) + "' object is not iterable");
-                    }
-                } break;
-            case OP_FOR_ITER:
-                {
-                    // __top() must be PyIter, so no need to __deref()
-                    auto& it = PyIter_AS_C(frame->__top());
-                    if(it->hasNext()){
-                        PyRef_AS_C(it->var)->set(this, frame, it->next());
-                    }else{
-                        int blockEnd = frame->code->co_blocks[byte.block].end;
-                        frame->jumpAbsoluteSafe(blockEnd);
-                    }
-                } break;
-            case OP_LOOP_CONTINUE:
-                {
-                    int blockStart = frame->code->co_blocks[byte.block].start;
-                    frame->jumpAbsolute(blockStart);
-                } break;
-            case OP_LOOP_BREAK:
-                {
-                    int blockEnd = frame->code->co_blocks[byte.block].end;
-                    frame->jumpAbsoluteSafe(blockEnd);
-                } break;
-            case OP_JUMP_IF_FALSE_OR_POP:
-                {
-                    const PyVar expr = frame->topValue(this);
-                    if(asBool(expr)==False) frame->jumpAbsolute(byte.arg);
-                    else frame->popValue(this);
-                } break;
-            case OP_JUMP_IF_TRUE_OR_POP:
-                {
-                    const PyVar expr = frame->topValue(this);
-                    if(asBool(expr)==True) frame->jumpAbsolute(byte.arg);
-                    else frame->popValue(this);
-                } break;
-            case OP_BUILD_SLICE:
-                {
-                    PyVar stop = frame->popValue(this);
-                    PyVar start = frame->popValue(this);
-                    _Slice s;
-                    if(start != None) {__checkType(start, _tp_int); s.start = (int)PyInt_AS_C(start);}
-                    if(stop != None) {__checkType(stop, _tp_int); s.stop = (int)PyInt_AS_C(stop);}
-                    frame->push(PySlice(s));
-                } break;
-            case OP_IMPORT_NAME:
-                {
-                    const _Str& name = frame->code->co_names[byte.arg].first;
-                    auto it = _modules.find(name);
-                    if(it == _modules.end()){
-                        auto it2 = _lazyModules.find(name);
-                        if(it2 == _lazyModules.end()){
-                            _error("ImportError", "module '" + name + "' not found");
-                        }else{
-                            const _Str& source = it2->second;
-                            _Code code = compile(source, name, EXEC_MODE);
-                            PyVar _m = newModule(name);
-                            _exec(code, _m, {});
-                            frame->push(_m);
-                            _lazyModules.erase(it2);
-                        }
-                    }else{
-                        frame->push(it->second);
-                    }
-                } break;
-            // TODO: using "goto" inside with block may cause __exit__ not called
-            case OP_WITH_ENTER: call(frame->popValue(this), __enter__); break;
-            case OP_WITH_EXIT: call(frame->popValue(this), __exit__); break;
-            default:
-                systemError(_Str("opcode ") + OP_NAMES[byte.op] + " is not implemented");
-                break;
             }
         }
 
@@ -348,6 +59,330 @@ protected:
 
         if(frame->stackSize() != 0) systemError("stack not empty in EXEC_MODE");
         return None;
+    }
+
+    PyVarOrNull runStep(Frame* frame){
+        const ByteCode& byte = frame->readCode();
+        _checkStopFlag();
+
+        if(frame->code->src->filename != "<builtins>"){
+            std::cout << OP_NAMES[byte.op] << " " << byte.arg << std::endl;
+        }
+
+        switch (byte.op)
+        {
+        case OP_NO_OP: break;       // do nothing
+        case OP_LOAD_CONST: frame->push(frame->code->co_consts[byte.arg]); break;
+        case OP_LOAD_LAMBDA: {
+            PyVar obj = frame->code->co_consts[byte.arg];
+            setAttr(obj, __module__, frame->_module);
+            frame->push(obj);
+        } break;
+        case OP_LOAD_NAME_REF: {
+            frame->push(PyRef(NameRef(
+                &(frame->code->co_names[byte.arg])
+            )));
+        } break;
+        case OP_STORE_NAME_REF: {
+            const auto& p = frame->code->co_names[byte.arg];
+            NameRef(&p).set(this, frame, frame->popValue(this));
+        } break;
+        case OP_BUILD_ATTR_REF: {
+            const auto& attr = frame->code->co_names[byte.arg];
+            PyVar obj = frame->popValue(this);
+            frame->push(PyRef(AttrRef(obj, NameRef(&attr))));
+        } break;
+        case OP_BUILD_INDEX_REF: {
+            PyVar index = frame->popValue(this);
+            PyVarRef obj = frame->popValue(this);
+            frame->push(PyRef(IndexRef(obj, index)));
+        } break;
+        case OP_STORE_REF: {
+            PyVar obj = frame->__pop();
+            PyVarRef r = frame->__pop();
+            obj = frame->__deref_pointer(this, obj);
+            PyRef_AS_C(r)->set(this, frame, std::move(obj));
+        } break;
+        case OP_DELETE_REF: {
+            PyVarRef r = frame->__pop();
+            PyRef_AS_C(r)->del(this, frame);
+        } break;
+        case OP_BUILD_SMART_TUPLE:
+        {
+            pkpy::ArgList items = frame->__popNReversed(byte.arg);
+            bool done = false;
+            for(int i=0; i<items.size(); i++){
+                if(!items[i]->isType(_tp_ref)) {
+                    done = true;
+                    PyVarList values(items.size());
+                    for(int i=0; i<items.size(); i++){
+                        values[i] = frame->__deref_pointer(this, items[i]);
+                    }
+                    frame->push(PyTuple(values));
+                    break;
+                }
+            }
+            if(done) break;
+            frame->push(PyRef(TupleRef(items.toList())));
+        } break;
+        case OP_BUILD_STRING:
+        {
+            pkpy::ArgList items = frame->popNValuesReversed(this, byte.arg);
+            _StrStream ss;
+            for(int i=0; i<items.size(); i++) ss << PyStr_AS_C(asStr(items[i]));
+            frame->push(PyStr(ss.str()));
+        } break;
+        case OP_LOAD_EVAL_FN: {
+            frame->push(builtins->attribs[m_eval]);
+        } break;
+        case OP_LIST_APPEND: {
+            pkpy::ArgList args(2);
+            args[1] = frame->popValue(this);            // obj
+            args[0] = frame->__topValueN(this, -2);     // list
+            fastCall(m_append, std::move(args));
+        } break;
+        case OP_STORE_FUNCTION:
+            {
+                PyVar obj = frame->popValue(this);
+                const _Func& fn = PyFunction_AS_C(obj);
+                setAttr(obj, __module__, frame->_module);
+                frame->f_globals()[fn->name] = obj;
+            } break;
+        case OP_BUILD_CLASS:
+            {
+                const _Str& clsName = frame->code->co_names[byte.arg].first;
+                PyVar clsBase = frame->popValue(this);
+                if(clsBase == None) clsBase = _tp_object;
+                __checkType(clsBase, _tp_type);
+                PyVar cls = newUserClassType(frame->_module, clsName, clsBase);
+                while(true){
+                    PyVar fn = frame->popValue(this);
+                    if(fn == None) break;
+                    const _Func& f = PyFunction_AS_C(fn);
+                    setAttr(fn, __module__, frame->_module);
+                    setAttr(cls, f->name, fn);
+                }
+            } break;
+        case OP_RETURN_VALUE: return frame->popValue(this);
+        case OP_PRINT_EXPR:
+            {
+                const PyVar expr = frame->topValue(this);
+                if(expr == None) break;
+                *_stdout << PyStr_AS_C(asRepr(expr)) << '\n';
+            } break;
+        case OP_POP_TOP: frame->popValue(this); break;
+        case OP_BINARY_OP:
+            {
+                frame->push(
+                    fastCall(BINARY_SPECIAL_METHODS[byte.arg],
+                    frame->popNValuesReversed(this, 2))
+                );
+            } break;
+        case OP_BITWISE_OP:
+            {
+                frame->push(
+                    fastCall(BITWISE_SPECIAL_METHODS[byte.arg],
+                    frame->popNValuesReversed(this, 2))
+                );
+            } break;
+        case OP_COMPARE_OP:
+            {
+                // for __ne__ we use the negation of __eq__
+                int op = byte.arg == 3 ? 2 : byte.arg;
+                PyVar res = fastCall(CMP_SPECIAL_METHODS[op], frame->popNValuesReversed(this, 2));
+                if(op != byte.arg) res = PyBool(!PyBool_AS_C(res));
+                frame->push(std::move(res));
+            } break;
+        case OP_IS_OP:
+            {
+                bool ret_c = frame->popValue(this) == frame->popValue(this);
+                if(byte.arg == 1) ret_c = !ret_c;
+                frame->push(PyBool(ret_c));
+            } break;
+        case OP_CONTAINS_OP:
+            {
+                PyVar rhs = frame->popValue(this);
+                bool ret_c = PyBool_AS_C(call(rhs, __contains__, pkpy::oneArg(frame->popValue(this))));
+                if(byte.arg == 1) ret_c = !ret_c;
+                frame->push(PyBool(ret_c));
+            } break;
+        case OP_UNARY_NEGATIVE:
+            {
+                PyVar obj = frame->popValue(this);
+                frame->push(numNegated(obj));
+            } break;
+        case OP_UNARY_NOT:
+            {
+                PyVar obj = frame->popValue(this);
+                const PyVar& obj_bool = asBool(obj);
+                frame->push(PyBool(!PyBool_AS_C(obj_bool)));
+            } break;
+        case OP_POP_JUMP_IF_FALSE:
+            if(!PyBool_AS_C(asBool(frame->popValue(this)))) frame->jumpAbsolute(byte.arg);
+            break;
+        case OP_LOAD_NONE: frame->push(None); break;
+        case OP_LOAD_TRUE: frame->push(True); break;
+        case OP_LOAD_FALSE: frame->push(False); break;
+        case OP_LOAD_ELLIPSIS: frame->push(Ellipsis); break;
+        case OP_RAISE:
+            {
+                PyVar obj = frame->popValue(this);
+                _Str msg = obj != None ? PyStr_AS_C(asStr(obj)) : "";
+                _Str type = PyStr_AS_C(frame->popValue(this));
+                _error(type, msg);
+            } break;
+        case OP_RE_RAISE: _raise_tos(); break; // TOS is the exception
+        case OP_EXCEPTION_MATCH:
+            {
+                PyVar name = frame->popValue(this);
+                const PyVar& err = frame->__top();
+                bool m = PyException_AS_C(err).matchType(PyStr_AS_C(name));
+                frame->push(PyBool(m));
+            } break;
+        case OP_ASSERT:
+            {
+                PyVar expr = frame->popValue(this);
+                if(asBool(expr)==False) _error("AssertionError", "");
+            } break;
+        case OP_BUILD_LIST:
+            {
+                frame->push(PyList(
+                    frame->popNValuesReversedUnlimited(this, byte.arg)
+                ));
+            } break;
+        case OP_BUILD_MAP:
+            {
+                PyVarList items = frame->popNValuesReversedUnlimited(this, byte.arg*2);
+                PyVar obj = call(builtins->attribs["dict"]);
+                for(int i=0; i<items.size(); i+=2){
+                    call(obj, __setitem__, pkpy::twoArgs(items[i], items[i+1]));
+                }
+                frame->push(obj);
+            } break;
+        case OP_BUILD_SET:
+            {
+                PyVar list = PyList(frame->popNValuesReversedUnlimited(this, byte.arg));
+                PyVar obj = call(builtins->attribs["set"], pkpy::oneArg(list));
+                frame->push(obj);
+            } break;
+        case OP_DUP_TOP: frame->push(frame->topValue(this)); break;
+        case OP_CALL:
+            {
+                int ARGC = byte.arg & 0xFFFF;
+                int KWARGC = (byte.arg >> 16) & 0xFFFF;
+                pkpy::ArgList kwargs(0);
+                if(KWARGC > 0) kwargs = frame->popNValuesReversed(this, KWARGC*2);
+                pkpy::ArgList args = frame->popNValuesReversed(this, ARGC);
+                PyVar callable = frame->popValue(this);
+                PyVar ret = call(callable, std::move(args), kwargs, true);
+                if(ret == __py2py_call_signal) return ret;
+                frame->push(std::move(ret));
+            } break;
+        case OP_JUMP_ABSOLUTE: frame->jumpAbsolute(byte.arg); break;
+        case OP_JUMP_RELATIVE: frame->jumpRelative(byte.arg); break;
+        case OP_SAFE_JUMP_ABSOLUTE: frame->jumpAbsoluteSafe(byte.arg); break;
+        case OP_GOTO: {
+            PyVar obj = frame->popValue(this);
+            const _Str& label = PyStr_AS_C(obj);
+            int* target = frame->code->co_labels.try_get(label);
+            if(target == nullptr) _error("KeyError", "label '" + label + "' not found");
+            frame->jumpAbsoluteSafe(*target);
+        } break;
+        case OP_GET_ITER:
+            {
+                PyVar obj = frame->popValue(this);
+                PyVarOrNull iter_fn = getAttr(obj, __iter__, false);
+                if(iter_fn != nullptr){
+                    PyVar tmp = call(iter_fn);
+                    PyVarRef var = frame->__pop();
+                    __checkType(var, _tp_ref);
+                    PyIter_AS_C(tmp)->var = var;
+                    frame->push(std::move(tmp));
+                }else{
+                    typeError("'" + UNION_TP_NAME(obj) + "' object is not iterable");
+                }
+            } break;
+        case OP_FOR_ITER:
+            {
+                // __top() must be PyIter, so no need to __deref()
+                auto& it = PyIter_AS_C(frame->__top());
+                if(it->hasNext()){
+                    PyRef_AS_C(it->var)->set(this, frame, it->next());
+                }else{
+                    int blockEnd = frame->code->co_blocks[byte.block].end;
+                    frame->jumpAbsoluteSafe(blockEnd);
+                }
+            } break;
+        case OP_LOOP_CONTINUE:
+            {
+                int blockStart = frame->code->co_blocks[byte.block].start;
+                frame->jumpAbsolute(blockStart);
+            } break;
+        case OP_LOOP_BREAK:
+            {
+                int blockEnd = frame->code->co_blocks[byte.block].end;
+                frame->jumpAbsoluteSafe(blockEnd);
+            } break;
+        case OP_JUMP_IF_FALSE_OR_POP:
+            {
+                const PyVar expr = frame->topValue(this);
+                if(asBool(expr)==False) frame->jumpAbsolute(byte.arg);
+                else frame->popValue(this);
+            } break;
+        case OP_JUMP_IF_TRUE_OR_POP:
+            {
+                const PyVar expr = frame->topValue(this);
+                if(asBool(expr)==True) frame->jumpAbsolute(byte.arg);
+                else frame->popValue(this);
+            } break;
+        case OP_BUILD_SLICE:
+            {
+                PyVar stop = frame->popValue(this);
+                PyVar start = frame->popValue(this);
+                _Slice s;
+                if(start != None) {__checkType(start, _tp_int); s.start = (int)PyInt_AS_C(start);}
+                if(stop != None) {__checkType(stop, _tp_int); s.stop = (int)PyInt_AS_C(stop);}
+                frame->push(PySlice(s));
+            } break;
+        case OP_IMPORT_NAME:
+            {
+                const _Str& name = frame->code->co_names[byte.arg].first;
+                auto it = _modules.find(name);
+                if(it == _modules.end()){
+                    auto it2 = _lazyModules.find(name);
+                    if(it2 == _lazyModules.end()){
+                        _error("ImportError", "module '" + name + "' not found");
+                    }else{
+                        const _Str& source = it2->second;
+                        _Code code = compile(source, name, EXEC_MODE);
+                        PyVar _m = newModule(name);
+                        _exec(code, _m, {});
+                        frame->push(_m);
+                        _lazyModules.erase(it2);
+                    }
+                }else{
+                    frame->push(it->second);
+                }
+            } break;
+        // TODO: using "goto" inside with block may cause __exit__ not called
+        case OP_WITH_ENTER: call(frame->popValue(this), __enter__); break;
+        case OP_WITH_EXIT: call(frame->popValue(this), __exit__); break;
+        default:
+            systemError(_Str("opcode ") + OP_NAMES[byte.op] + " is not implemented");
+            break;
+        }
+
+            if(frame->code->src->filename != "<builtins>"){
+                _StrStream ss;
+                ss << '[';
+                for(PyVar obj : frame->__debugStackData()){
+                    ss << PyStr_AS_C(asRepr(obj)) << ", ";
+                }
+                ss << "]";
+                std::cout << ss.str() << std::endl;
+            }
+
+        return nullptr;
     }
 
 public:
@@ -555,13 +590,13 @@ public:
         if(_module == nullptr) _module = _main;
         try {
             _Code code = compile(source, filename, mode);
-            // if(filename != "<builtins>") std::cout << disassemble(code) << std::endl;
+            if(filename != "<builtins>") std::cout << disassemble(code) << std::endl;
             return _exec(code, _module, {});
         }catch (const _Error& e){
-            *_stderr << e.what() << '\n';
+            *_stderr << e.message() << '\n';
         }catch (const std::exception& e) {
-            auto re = RuntimeError("UnexpectedError", e.what(), _cleanErrorAndGetSnapshots());
-            *_stderr << re.what() << '\n';
+            auto re = RuntimeError("UnexpectedError", e.what());
+            *_stderr << re.message() << '\n';
         }
         return nullptr;
     }
@@ -573,7 +608,7 @@ public:
     Frame* __pushNewFrame(const _Code& code, PyVar _module, PyVarDict&& locals){
         if(code == nullptr) UNREACHABLE();
         if(callstack.size() > maxRecursionDepth){
-            throw RuntimeError("RecursionError", "maximum recursion depth exceeded", _cleanErrorAndGetSnapshots());
+            _error("RecursionError", "maximum recursion depth exceeded");
         }
         Frame* frame = new Frame(code, _module, std::move(locals));
         callstack.emplace_back(pkpy::unique_ptr<Frame>(frame));
@@ -774,6 +809,12 @@ public:
     }
 
     _Str disassemble(_Code code){
+        std::vector<int> jumpTargets;
+        for(auto byte : code->co_code){
+            if(byte.op == OP_JUMP_ABSOLUTE || byte.op == OP_SAFE_JUMP_ABSOLUTE){
+                jumpTargets.push_back(byte.arg);
+            }
+        }
         _StrStream ss;
         int prev_line = -1;
         for(int i=0; i<code->co_code.size(); i++){
@@ -784,9 +825,23 @@ public:
                 if(prev_line != -1) ss << "\n";
                 prev_line = byte.line;
             }
-            ss << pad(line, 12) << " " << pad(std::to_string(i), 3);
+
+            std::string pointer;
+            if(std::find(jumpTargets.begin(), jumpTargets.end(), i) != jumpTargets.end()){
+                pointer = "-> ";
+            }else{
+                pointer = "   ";
+            }
+            ss << pad(line, 8) << pointer << pad(std::to_string(i), 3);
             ss << " " << pad(OP_NAMES[byte.op], 20) << " ";
-            ss << pad(byte.arg == -1 ? "" : std::to_string(byte.arg), 5);
+            std::string argStr = byte.arg == -1 ? "" : std::to_string(byte.arg);
+            if(byte.op == OP_LOAD_CONST){
+                argStr += " (" + PyStr_AS_C(asRepr(code->co_consts[byte.arg])) + ")";
+            }
+            if(byte.op == OP_LOAD_NAME_REF){
+                argStr += " (" + code->co_names[byte.arg].first.__escape(true) + ")";
+            }
+            ss << pad(argStr, 20);
             ss << code->co_blocks[byte.block].toString();
             if(i != code->co_code.size() - 1) ss << '\n';
         }
@@ -810,7 +865,7 @@ public:
     PyVar _tp_list, _tp_tuple;
     PyVar _tp_function, _tp_native_function, _tp_native_iterator, _tp_bounded_method;
     PyVar _tp_slice, _tp_range, _tp_module, _tp_ref;
-    PyVar _tp_super;
+    PyVar _tp_super, _tp_exception;
 
     template<typename P>
     inline PyVarRef PyRef(P&& value) {
@@ -840,6 +895,7 @@ public:
     DEF_NATIVE(BoundedMethod, _BoundedMethod, _tp_bounded_method)
     DEF_NATIVE(Range, _Range, _tp_range)
     DEF_NATIVE(Slice, _Slice, _tp_slice)
+    DEF_NATIVE(Exception, RuntimeError, _tp_exception)
     
     // there is only one True/False, so no need to copy them!
     inline bool PyBool_AS_C(const PyVar& obj){return obj == True;}
@@ -871,6 +927,7 @@ public:
         _tp_native_iterator = newClassType("_native_iterator");
         _tp_bounded_method = newClassType("_bounded_method");
         _tp_super = newClassType("super");
+        _tp_exception = newClassType("Exception");
 
         this->None = newObject(_types["NoneType"], (_Int)0);
         this->Ellipsis = newObject(_types["ellipsis"], (_Int)0);
@@ -921,46 +978,37 @@ public:
 
     /***** Error Reporter *****/
 private:
-    void _error(const _Str& name, const _Str& msg){
-        throw RuntimeError(name, msg, _cleanErrorAndGetSnapshots());
+    void _raise_tos(){
+        const PyVar& obj = topFrame()->__top();
+        if(!obj->isType(_tp_exception)) UNREACHABLE();
+        std::cout << "throw PyRaiseEvent();" << std::endl;
+        throw PyRaiseEvent();
     }
 
-    std::stack<_Str> _cleanErrorAndGetSnapshots(){
-        std::stack<_Str> snapshots;
-        while (!callstack.empty()){
-            if(snapshots.size() < 8){
-                snapshots.push(callstack.back()->errorSnapshot());
-            }
-            callstack.pop_back();
-        }
-        return snapshots;
+    /*[[nodiscard]]*/
+    void _error(const _Str& name, const _Str& msg){
+        topFrame()->push(PyException(RuntimeError(name, msg)));
+        _raise_tos();
     }
+
+    // std::stack<_Str> _cleanErrorAndGetSnapshots(){
+    //     std::stack<_Str> snapshots;
+    //     while (!callstack.empty()){
+    //         if(snapshots.size() < 8){
+    //             snapshots.push(callstack.back()->errorSnapshot());
+    //         }
+    //         callstack.pop_back();
+    //     }
+    //     return snapshots;
+    // }
 
 public:
-    void typeError(const _Str& msg){
-        _error("TypeError", msg);
-    }
-
-    void systemError(const _Str& msg){
-        _error("SystemError", msg);
-    }
-
-    void zeroDivisionError(){
-        _error("ZeroDivisionError", "division by zero");
-    }
-
-    void indexError(const _Str& msg){
-        _error("IndexError", msg);
-    }
-
-    void valueError(const _Str& msg){
-        _error("ValueError", msg);
-    }
-
-    void nameError(const _Str& name){
-        _error("NameError", "name '" + name + "' is not defined");
-    }
-
+    void typeError(const _Str& msg){ _error("TypeError", msg); }
+    void systemError(const _Str& msg){ _error("SystemError", msg); }
+    void zeroDivisionError(){ _error("ZeroDivisionError", "division by zero"); }
+    void indexError(const _Str& msg){ _error("IndexError", msg); }
+    void valueError(const _Str& msg){ _error("ValueError", msg); }
+    void nameError(const _Str& name){ _error("NameError", "name '" + name + "' is not defined"); }
     void attributeError(PyVar obj, const _Str& name){
         _error("AttributeError", "type '" +  UNION_TP_NAME(obj) + "' has no attribute '" + name + "'");
     }
@@ -975,10 +1023,6 @@ public:
         if(args.size() == size) return;
         if(method) typeError(args.size()>size ? "too many arguments" : "too few arguments");
         else typeError("expected " + std::to_string(size) + " arguments, but got " + std::to_string(args.size()));
-    }
-
-    void _assert(bool val, const _Str& msg){
-        if (!val) _error("AssertionError", msg);
     }
 
     virtual ~VM() {

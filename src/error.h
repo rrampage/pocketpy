@@ -73,33 +73,54 @@ class _Error : public std::exception {
 private:
     _Str _what;
 public:
-    _Error(_Str type, _Str msg, _Str desc){
-        _what = desc + type + ": " + msg;
+    _Error(_Str type, _Str msg){
+        _what = type + ": " + msg;
     }
 
     const char* what() const noexcept override {
         return _what.c_str();
     }
+
+    virtual _Str message() const noexcept {
+        return _what;
+    }
 };
 
 class CompileError : public _Error {
+    _Str snapshot;
 public:
-    CompileError(_Str type, _Str msg, _Str snapshot)
-        : _Error(type, msg, snapshot) {}
+    CompileError(_Str type, _Str msg, _Str snapshot): _Error(type, msg) {
+        this->snapshot = snapshot;
+    }
+
+    _Str message() const noexcept override {
+        return snapshot + _Error::what();
+    }
 };
 
 class RuntimeError : public _Error {
-private:
-    static _Str __concat(std::stack<_Str> snapshots){
+    std::vector<_Str> snapshots;
+    _Str type;
+public:
+    RuntimeError(_Str type, _Str msg): _Error(type, msg) {
+        this->type = type;
+    }
+
+    _Str message() const noexcept override {
         _StrStream ss;
         ss << "Traceback (most recent call last):" << '\n';
-        while(!snapshots.empty()){
-            ss << snapshots.top();
-            snapshots.pop();
-        }
-        return ss.str();
+        for(auto it=snapshots.crbegin(); it!=snapshots.crend(); ++it) ss << *it;
+        return ss.str() + _Error::what();
     }
-public:
-    RuntimeError(_Str type, _Str msg, const std::stack<_Str>& snapshots)
-        : _Error(type, msg, __concat(snapshots)) {}
+
+    void addSnapshot(_Str snapshot){
+        if(snapshot.size() >= 8) return;
+        snapshots.push_back(snapshot);
+    }
+
+    bool matchType(_Str type) const noexcept {
+        return this->type == type;
+    }
 };
+
+class PyRaiseEvent {};
