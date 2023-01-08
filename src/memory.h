@@ -160,3 +160,15 @@ namespace pkpy{
         return unique_ptr<T>(new T(std::forward<Args>(args)...));
     }
 };
+
+
+namespace pkpy{
+    class scope_guard {
+        std::function<void()> cleanup;
+        bool dismissed = false;
+    public:
+        void dismiss() { dismissed = true; }
+        scope_guard(std::function<void()> cleanup) : cleanup(cleanup) {}
+        ~scope_guard() { if (!dismissed) cleanup(); }
+    };
+};

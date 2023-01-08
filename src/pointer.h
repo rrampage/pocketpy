@@ -5,8 +5,8 @@
 class Frame;
 
 struct BaseRef {
-    virtual PyVar get(VM*, Frame*) const = 0;
-    virtual void set(VM*, Frame*, PyVar) const = 0;
+    virtual PyObject* get(VM*, Frame*) const = 0;
+    virtual void set(VM*, Frame*, PyObject*) const = 0;
     virtual void del(VM*, Frame*) const = 0;
     virtual ~BaseRef() = default;
 };
@@ -19,30 +19,30 @@ enum NameScope {
 
 struct NameRef : BaseRef {
     const std::pair<_Str, NameScope>* pair;
-    NameRef(const std::pair<_Str, NameScope>* pair) : pair(pair) {}
+    NameRef(const std::pair<_Str, NameScope>& pair) : pair(&pair) {}
 
-    PyVar get(VM* vm, Frame* frame) const;
-    void set(VM* vm, Frame* frame, PyVar val) const;
+    PyObject* get(VM* vm, Frame* frame) const;
+    void set(VM* vm, Frame* frame, PyObject* val) const;
     void del(VM* vm, Frame* frame) const;
 };
 
 struct AttrRef : BaseRef {
-    mutable PyVar obj;
+    mutable PyAutoRef obj;
     const NameRef attr;
-    AttrRef(PyVar obj, const NameRef attr) : obj(obj), attr(attr) {}
+    AttrRef(PyObject* obj, const NameRef attr) : obj(obj->share()), attr(attr) {}
 
-    PyVar get(VM* vm, Frame* frame) const;
-    void set(VM* vm, Frame* frame, PyVar val) const;
+    PyObject* get(VM* vm, Frame* frame) const;
+    void set(VM* vm, Frame* frame, PyObject* val) const;
     void del(VM* vm, Frame* frame) const;
 };
 
 struct IndexRef : BaseRef {
-    mutable PyVar obj;
-    PyVar index;
-    IndexRef(PyVar obj, PyVar index) : obj(obj), index(index) {}
+    mutable PyAutoRef obj;
+    PyAutoRef index;
+    IndexRef(PyObject* obj, PyObject* index) : obj(obj->share()), index(index->share()) {}
 
-    PyVar get(VM* vm, Frame* frame) const;
-    void set(VM* vm, Frame* frame, PyVar val) const;
+    PyObject* get(VM* vm, Frame* frame) const;
+    void set(VM* vm, Frame* frame, PyObject* val) const;
     void del(VM* vm, Frame* frame) const;
 };
 
@@ -51,7 +51,7 @@ struct TupleRef : BaseRef {
     TupleRef(const PyVarList& varRefs) : varRefs(varRefs) {}
     TupleRef(PyVarList&& varRefs) : varRefs(std::move(varRefs)) {}
 
-    PyVar get(VM* vm, Frame* frame) const;
-    void set(VM* vm, Frame* frame, PyVar val) const;
+    PyObject* get(VM* vm, Frame* frame) const;
+    void set(VM* vm, Frame* frame, PyObject* val) const;
     void del(VM* vm, Frame* frame) const;
 };

@@ -5,33 +5,47 @@
 #include "str.h"
 
 struct PyObject;
-typedef pkpy::shared_ptr<PyObject> PyVar;
+
+class PyVar{
+    PyObject* obj;
+public:
+    PyVar(PyObject* obj) : obj(obj) {}
+    PyVar(const PyVar& other) : obj(other.obj) { if(obj!=nullptr) obj->incref(); }
+    PyVar(PyVar&& other) noexcept : obj(other.obj) { other.obj = nullptr; }
+    ~PyVar() { if(obj!=nullptr) obj->decref(); }
+    inline PyWeakRef get() const{ return obj; }
+    inline PyObject* unshare() { auto ret = obj; obj = nullptr; return ret; }
+    inline PyWeakRef operator->() const{ return obj; }
+    inline PyObject& operator*() const{ return *obj; }
+    PyVar& operator=(const PyVar& other) {
+        if (this != &other) {
+            if(obj!=nullptr) obj->decref();
+            obj = other.obj;
+            if(obj!=nullptr) obj->incref();
+        }
+        return *this;
+    }
+    PyVar& operator=(PyVar&& other) noexcept {
+        if (this != &other) {
+            if(obj!=nullptr) obj->decref();
+            obj = other.obj;
+            other.obj = nullptr;
+        }
+        return *this;
+    }
+};
+
 typedef PyVar PyVarOrNull;
 typedef PyVar PyVarRef;
 
 class PyVarList: public std::vector<PyVar> {
     PyVar& at(size_t) = delete;
-
-    inline void __checkIndex(size_t i) const {
-#ifndef PKPY_NO_INDEX_CHECK
-        if (i >= size()){
-            auto msg = "std::vector index out of range, " + std::to_string(i) + " not in [0, " + std::to_string(size()) + ")";
-            throw std::out_of_range(msg);
-        }
-#endif
-    }
 public:
     PyVar& operator[](size_t i) {
-        __checkIndex(i);
+        if (i >= size()) throw std::out_of_range("std::vector index out of range, " + std::to_string(i) + " not in [0, " + std::to_string(size()) + ")");
         return std::vector<PyVar>::operator[](i);
     }
 
-    const PyVar& operator[](size_t i) const {
-        __checkIndex(i);
-        return std::vector<PyVar>::operator[](i);
-    }
-
-    // define constructors the same as std::vector
     using std::vector<PyVar>::vector;
 };
 
@@ -46,12 +60,10 @@ namespace pkpy {
         uint8_t _size = 0;
 
         inline void __checkIndex(uint8_t i) const {
-#ifndef PKPY_NO_INDEX_CHECK
             if (i >= _size){
                 auto msg = "pkpy:ArgList index out of range, " + std::to_string(i) + " not in [0, " + std::to_string(size()) + ")";
                 throw std::out_of_range(msg);
             }
-#endif
         }
 
         void __tryAlloc(size_t n){

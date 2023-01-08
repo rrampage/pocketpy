@@ -16,11 +16,11 @@ static const char* OP_NAMES[] = {
     #undef OPCODE
 };
 
-struct ByteCode{
+struct Bytecode{
     uint8_t op;
     int arg;
-    uint16_t line;
-    uint16_t block;     // the block id of this bytecode
+    int line;           // the line number
+    uint16_t block;     // the block id
 };
 
 _Str pad(const _Str& s, const int n){
@@ -82,7 +82,7 @@ struct CodeObject {
         return src->mode;
     }
 
-    std::vector<ByteCode> co_code;
+    std::vector<Bytecode> co_code;
     PyVarList co_consts;
     std::vector<std::pair<_Str, NameScope>> co_names;
     std::vector<_Str> co_global_names;
@@ -148,88 +148,71 @@ struct CodeObject {
 
 class Frame {
 private:
-    std::vector<PyVar> s_data;
-    int ip = 0;
+    std::vector<PyObject*> s_data;
+    int ip = -1;         // the current instruction pointer
+    int next_ip = 0;     // the next instruction pointer
 public:
     const _Code code;
     PyVar _module;
     PyVarDict f_locals;
 
-    inline PyVarDict copy_f_locals() const {
-        return f_locals;
-    }
-
-    inline PyVarDict& f_globals(){
-        return _module->attribs;
-    }
-
     Frame(const _Code code, PyVar _module, PyVarDict&& locals)
         : code(code), _module(_module), f_locals(std::move(locals)) {
     }
 
-    inline const ByteCode& readCode() {
-        return code->co_code[ip++];
+    inline PyVarDict copy_f_locals() const noexcept { return f_locals; }
+    inline PyVarDict& f_globals() noexcept { return _module->attribs; }
+
+    inline const Bytecode& next_bytecode() noexcept {
+        ip = next_ip;
+        next_ip = ip + 1;
+        return code->co_code[ip];
     }
 
-    _Str errorSnapshot(){
-        int line = code->co_code[ip-1].line;
-        return code->src->snapshot(line);
-    }
-
-    inline int stackSize() const {
-        return s_data.size();
-    }
-
-    inline auto __debugStackData() const{
-        return s_data;
-    }
-
-    inline bool isCodeEnd() const {
+    inline bool is_bytecode_ended() const noexcept {
         return ip >= code->co_code.size();
     }
 
-    inline PyVar __pop(){
+    template<typename T>
+    inline void push(T&& obj) noexcept{
+        s_data.push_back(std::forward<T>(obj));
+    }
+
+    inline PyObject* pop(){
         if(s_data.empty()) throw std::runtime_error("s_data.empty() is true");
-        PyVar v = std::move(s_data.back());
+        PyObject* obj = s_data.back();
         s_data.pop_back();
+        return obj;
+    }
+
+    PyVarList pop_n_reversed_unlimited(VM* vm, int n){
+        PyVarList v(n);
+        for(int i=n-1; i>=0; i--) v[i] = pop();
         return v;
     }
 
-    inline PyVar __deref_pointer(VM*, PyVar);
-
-    inline PyVar popValue(VM* vm){
-        return __deref_pointer(vm, __pop());
+    pkpy::ArgList pop_n_reversed(int n){
+        pkpy::ArgList v(n);
+        for(int i=n-1; i>=0; i--) v._index(i) = pop();
+        return v;
     }
 
-    inline PyVar topValue(VM* vm){
-        if(s_data.empty()) throw std::runtime_error("s_data.empty() is true");
-        return __deref_pointer(vm, s_data.back());
-    }
-
-    inline PyVar& __top(){
+    inline PyObject*& top() {
         if(s_data.empty()) throw std::runtime_error("s_data.empty() is true");
         return s_data.back();
     }
 
-    inline PyVar __topValueN(VM* vm, int n=-1){
-        return __deref_pointer(vm, s_data[s_data.size() + n]);
+    inline PyObject* top_offset(VM* vm, int n=-1) const{
+        size_t i = s_data.size() + n;
+        if(i >= s_data.size()) throw std::runtime_error("top_offset out of range");
+        return s_data[i];
     }
 
-    template<typename T>
-    inline void push(T&& obj){
-        s_data.push_back(std::forward<T>(obj));
-    }
-
-    inline void jumpAbsolute(int i){
-        this->ip = i;
-    }
-
-    inline void jumpRelative(int i){
-        this->ip += i;
-    }
+    inline void jump_abs(int i) noexcept{ next_ip = i; }
+    inline void jump_rel(int i) noexcept{ next_ip = ip + i; }
 
     void jumpAbsoluteSafe(int target){
-        const ByteCode& prev = code->co_code[this->ip];
+        const Bytecode& prev = code->co_code[this->ip];
         int i = prev.block;
         this->ip = target;
         if(isCodeEnd()){
@@ -238,7 +221,7 @@ public:
                 i = code->co_blocks[i].parent;
             }
         }else{
-            const ByteCode& next = code->co_code[target];
+            const Bytecode& next = code->co_code[target];
             while(i>=0 && i!=next.block){
                 if(code->co_blocks[i].type == FOR_LOOP) __pop();
                 i = code->co_blocks[i].parent;
@@ -250,7 +233,7 @@ public:
     }
 
     bool jumpToNextExceptionHandler(){
-        const ByteCode& curr = code->co_code[this->ip];
+        const Bytecode& curr = code->co_code[this->ip];
         int i = curr.block;
         while(i>=0){
             if(code->co_blocks[i].type == TRY_EXCEPT){
@@ -263,21 +246,17 @@ public:
         return false;
     }
 
-    pkpy::ArgList popNValuesReversed(VM* vm, int n){
-        pkpy::ArgList v(n);
-        for(int i=n-1; i>=0; i--) v._index(i) = popValue(vm);
-        return v;
+
+    _Str errorSnapshot(){
+        int line = code->co_code[ip].line;
+        return code->src->snapshot(line);
     }
 
-    PyVarList popNValuesReversedUnlimited(VM* vm, int n){
-        PyVarList v(n);
-        for(int i=n-1; i>=0; i--) v[i] = popValue(vm);
-        return v;
+    inline int stackSize() const noexcept {
+        return s_data.size();
     }
 
-    pkpy::ArgList __popNReversed(int n){
-        pkpy::ArgList v(n);
-        for(int i=n-1; i>=0; i--) v._index(i) = __pop();
-        return v;
+    inline auto __debugStackData() const noexcept{
+        return s_data;
     }
 };

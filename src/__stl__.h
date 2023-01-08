@@ -40,4 +40,3 @@
 #define PK_VERSION "0.6.2"
 
 //#define PKPY_NO_TYPE_CHECK
-//#define PKPY_NO_INDEX_CHECK

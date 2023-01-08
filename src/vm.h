@@ -5,14 +5,14 @@
 #include "error.h"
 
 #define __DEF_PY_AS_C(type, ctype, ptype)                       \
-    inline ctype& Py##type##_AS_C(const PyVar& obj) {           \
+    inline ctype& Py##type##_AS_C(PyWeakRef obj) {              \
         __checkType(obj, ptype);                                \
         return UNION_GET(ctype, obj);                           \
     }
 
 #define __DEF_PY(type, ctype, ptype)                            \
-    inline PyVar Py##type(ctype value) {                        \
-        return newObject(ptype, value);                         \
+    inline PyObject* Py##type(ctype value) {                    \
+        return new_object(ptype, value);                        \
     }
 
 #define DEF_NATIVE(type, ctype, ptype)                          \
@@ -37,7 +37,7 @@ protected:
     }
 
     PyVar runFrame(Frame* frame){
-        while(!frame->isCodeEnd()){
+        while(!frame->is_bytecode_ended()){
             try{
                 PyVarOrNull ret = runStep(frame);
                 if(ret != nullptr) return ret;
@@ -53,63 +53,77 @@ protected:
         }
 
         if(frame->code->src->mode == EVAL_MODE || frame->code->src->mode == JSON_MODE){
-            if(frame->stackSize() != 1) systemError("stack size is not 1 in EVAL_MODE/JSON_MODE");
+            if(frame->stackSize() != 1) throw std::runtime_error("stack size is not 1 in EVAL_MODE/JSON_MODE");
             return frame->popValue(this);
         }
 
-        if(frame->stackSize() != 0) systemError("stack not empty in EXEC_MODE");
+        if(frame->stackSize() != 0) throw std::runtime_error("stack not empty in EXEC_MODE");
         return None;
     }
 
+    void try_deref(Frame* frame, PyObject** p){
+        if(!(*p)->is_type(_tp_ref)) return;
+        PyObject* obj = *p;
+        *p = PyRef_AS_C(obj)->get(this, frame);  // this could throw
+        obj->decref();
+    }
+
     PyVarOrNull runStep(Frame* frame){
-        const ByteCode& byte = frame->readCode();
+        const Bytecode& byte = frame->next_bytecode();
         _checkStopFlag();
 
-        if(frame->code->src->filename != "<builtins>"){
-            std::cout << OP_NAMES[byte.op] << " " << byte.arg << std::endl;
-        }
+        // if(frame->code->src->filename != "<builtins>"){
+        //     std::cout << OP_NAMES[byte.op] << " " << byte.arg << std::endl;
+        // }
 
         switch (byte.op)
         {
         case OP_NO_OP: break;       // do nothing
-        case OP_LOAD_CONST: frame->push(frame->code->co_consts[byte.arg]); break;
+        case OP_LOAD_CONST: frame->push(frame->code->co_consts[byte.arg]->copy()); break;
         case OP_LOAD_LAMBDA: {
-            PyVar obj = frame->code->co_consts[byte.arg];
-            setAttr(obj, __module__, frame->_module);
-            frame->push(obj);
+            PyWeakRef lambda = frame->code->co_consts[byte.arg].get();  // weak ref
+            setattr(lambda, __module__, frame->_module->copy());
+            frame->push(lambda);
         } break;
-        case OP_LOAD_NAME_REF: {
-            frame->push(PyRef(NameRef(
-                &(frame->code->co_names[byte.arg])
-            )));
-        } break;
+        case OP_LOAD_NAME_REF: frame->push(PyRef(NameRef(frame->code->co_names[byte.arg]))); break;
         case OP_STORE_NAME_REF: {
-            const auto& p = frame->code->co_names[byte.arg];
-            NameRef(&p).set(this, frame, frame->popValue(this));
+            const auto& name = frame->code->co_names[byte.arg];
+            PyObject* obj = frame->pop();
+            try_deref(frame, &obj);
+            NameRef(name).set(this, frame, obj);
         } break;
         case OP_BUILD_ATTR_REF: {
             const auto& attr = frame->code->co_names[byte.arg];
-            PyVar obj = frame->popValue(this);
-            frame->push(PyRef(AttrRef(obj, NameRef(&attr))));
+            PyObject* obj = frame->pop();
+            try_deref(frame, &obj);
+            frame->push(PyRef(AttrRef(obj, NameRef(attr))));
         } break;
         case OP_BUILD_INDEX_REF: {
-            PyVar index = frame->popValue(this);
-            PyVarRef obj = frame->popValue(this);
+            PyObject* index = frame->pop(); 
+            PyObject* obj = frame->pop();
+            try{
+                try_deref(frame, &index);
+                try_deref(frame, &obj);
+            }catch(...){
+                index->decref();
+                obj->decref();
+                throw;
+            }
             frame->push(PyRef(IndexRef(obj, index)));
         } break;
         case OP_STORE_REF: {
-            PyVar obj = frame->__pop();
-            PyVarRef r = frame->__pop();
-            obj = frame->__deref_pointer(this, obj);
-            PyRef_AS_C(r)->set(this, frame, std::move(obj));
+            PyObject* obj = frame->pop();
+            PyAutoRef ref = frame->pop()->share();
+            try_deref(frame, &obj);
+            PyRef_AS_C(ref.get())->set(this, frame, obj);
         } break;
         case OP_DELETE_REF: {
-            PyVarRef r = frame->__pop();
-            PyRef_AS_C(r)->del(this, frame);
+            PyAutoRef ref = frame->pop()->share();
+            PyRef_AS_C(ref.get())->del(this, frame);
         } break;
         case OP_BUILD_SMART_TUPLE:
         {
-            pkpy::ArgList items = frame->__popNReversed(byte.arg);
+            pkpy::ArgList items = frame->pop_n_reversed(byte.arg);
             bool done = false;
             for(int i=0; i<items.size(); i++){
                 if(!items[i]->isType(_tp_ref)) {
@@ -145,7 +159,7 @@ protected:
             {
                 PyVar obj = frame->popValue(this);
                 const _Func& fn = PyFunction_AS_C(obj);
-                setAttr(obj, __module__, frame->_module);
+                setattr(obj, __module__, frame->_module);
                 frame->f_globals()[fn->name] = obj;
             } break;
         case OP_BUILD_CLASS:
@@ -154,13 +168,13 @@ protected:
                 PyVar clsBase = frame->popValue(this);
                 if(clsBase == None) clsBase = _tp_object;
                 __checkType(clsBase, _tp_type);
-                PyVar cls = newUserClassType(frame->_module, clsName, clsBase);
+                PyWeakRef cls = new_user_type(frame->_module, clsName, clsBase);
                 while(true){
                     PyVar fn = frame->popValue(this);
                     if(fn == None) break;
                     const _Func& f = PyFunction_AS_C(fn);
-                    setAttr(fn, __module__, frame->_module);
-                    setAttr(cls, f->name, fn);
+                    setattr(fn, __module__, frame->_module);
+                    setattr(cls, f->name, fn);
                 }
             } break;
         case OP_RETURN_VALUE: return frame->popValue(this);
@@ -372,15 +386,15 @@ protected:
             break;
         }
 
-            if(frame->code->src->filename != "<builtins>"){
-                _StrStream ss;
-                ss << '[';
-                for(PyVar obj : frame->__debugStackData()){
-                    ss << PyStr_AS_C(asRepr(obj)) << ", ";
-                }
-                ss << "]";
-                std::cout << ss.str() << std::endl;
-            }
+            // if(frame->code->src->filename != "<builtins>"){
+            //     _StrStream ss;
+            //     ss << '[';
+            //     for(PyVar obj : frame->__debugStackData()){
+            //         ss << PyStr_AS_C(asRepr(obj)) << ", ";
+            //     }
+            //     ss << "]";
+            //     std::cout << ss.str() << std::endl;
+            // }
 
         return nullptr;
     }
@@ -590,7 +604,7 @@ public:
         if(_module == nullptr) _module = _main;
         try {
             _Code code = compile(source, filename, mode);
-            if(filename != "<builtins>") std::cout << disassemble(code) << std::endl;
+            //if(filename != "<builtins>") std::cout << disassemble(code) << std::endl;
             return _exec(code, _module, {});
         }catch (const _Error& e){
             *_stderr << e.message() << '\n';
@@ -639,38 +653,38 @@ public:
         return ret;
     }
 
-    PyVar newUserClassType(PyVar mod, _Str name, PyVar base){
-        PyVar obj = pkpy::make_shared<PyObject, Py_<_Int>>((_Int)1, _tp_type);
-        setAttr(obj, __base__, base);
-        _Str fullName = UNION_NAME(mod) + "." +name;
-        setAttr(obj, __name__, PyStr(fullName));
-        _userTypes[fullName] = obj;
-        setAttr(mod, name, obj);
+    PyWeakRef new_user_type(PyWeakRef mod, _Str name, PyWeakRef base){
+        PyObject* obj = new_object(_tp_type, (_Int)2);
+        setattr(obj, __base__, base);
+        _Str fullName = UNION_NAME(mod) + "." + name;
+        setattr(obj, __name__, PyStr(fullName));
+        setattr(mod, name, obj);
+        _userTypes[fullName] = obj->share();
         return obj;
     }
 
-    PyVar newClassType(_Str name, PyVar base=nullptr) {
-        if(base == nullptr) base = _tp_object;
-        PyVar obj = pkpy::make_shared<PyObject, Py_<_Int>>((_Int)0, _tp_type);
-        setAttr(obj, __base__, base);
-        _types[name] = obj;
+    PyWeakRef new_type(_Str name, PyWeakRef base=nullptr) {
+        if(base == nullptr) base = _tp_object.get();
+        PyObject* obj = new_object(_tp_type, (_Int)1);
+        setattr(obj, __base__, base);
+        _types[name] = obj->share();
         return obj;
     }
 
     template<typename T>
-    inline PyVar newObject(PyVar type, T _value) {
-        __checkType(type, _tp_type);
-        return pkpy::make_shared<PyObject, Py_<T>>(_value, type);
+    inline PyObject* new_object(const PyAutoRef& type, T _value) {
+        if(!type->is_type(_tp_type)) UNREACHABLE();
+        return Py_<T>(_value, type);
     }
 
-    PyVar newModule(_Str name) {
-        PyVar obj = newObject(_tp_module, (_Int)-2);
-        setAttr(obj, __name__, PyStr(name));
-        _modules[name] = obj;
-        return obj;
+    PyWeakRef new_module(_Str name) {
+        PyObject* obj = new_object(_tp_module, (_Int)-2);
+        setattr(obj, __name__, PyStr(name));
+        _modules[name] = obj->share();
+        return obj;     // lost ownership
     }
 
-    void addLazyModule(_Str name, _Str source){
+    void new_lazy_module(_Str name, _Str source) {
         _lazyModules[name] = source;
     }
 
@@ -713,30 +727,9 @@ public:
         return nullptr;
     }
 
-    void setAttr(PyVar& obj, const _Str& name, const PyVar& value) {
-        if(obj->isType(_tp_super)){
-            const PyVar* root = &obj;
-            while(true){
-                root = &UNION_GET(PyVar, *root);
-                if(!(*root)->isType(_tp_super)) break;
-            }
-            (*root)->attribs[name] = value;
-        }else{
-            obj->attribs[name] = value;
-        }
-    }
-
-    void setAttr(PyVar& obj, const _Str& name, PyVar&& value) {
-        if(obj->isType(_tp_super)){
-            const PyVar* root = &obj;
-            while(true){
-                root = &UNION_GET(PyVar, *root);
-                if(!(*root)->isType(_tp_super)) break;
-            }
-            (*root)->attribs[name] = std::move(value);
-        }else{
-            obj->attribs[name] = std::move(value);
-        }
+    void setattr(PyWeakRef obj, const _Str& name, PyObject* value) noexcept {
+        while(obj->is_type(_tp_super)) obj = UNION_GET(PyVar, obj).get();
+        obj->attribs[name] = value->share();
     }
 
     void bindMethod(_Str typeName, _Str funcName, _CppFunc fn) {
@@ -744,7 +737,7 @@ public:
         if(type == nullptr) type = _userTypes.try_get(typeName);
         if(type == nullptr) UNREACHABLE();
         PyVar func = PyNativeFunction(fn);
-        setAttr(*type, funcName, func);
+        setattr(*type, funcName, func);
     }
 
     void bindMethodMulti(std::vector<_Str> typeNames, _Str funcName, _CppFunc fn) {
@@ -760,7 +753,7 @@ public:
     void bindFunc(PyVar module, _Str funcName, _CppFunc fn) {
         __checkType(module, _tp_module);
         PyVar func = PyNativeFunction(fn);
-        setAttr(module, funcName, func);
+        setattr(module, funcName, func);
     }
 
     bool isInstance(PyVar obj, PyVar type){
@@ -773,12 +766,12 @@ public:
         return false;
     }
 
-    inline bool isIntOrFloat(const PyVar& obj){
-        return obj->isType(_tp_int) || obj->isType(_tp_float);
+    inline bool is_number(PyWeakRef obj) const noexcept{
+        return obj->is_type(_tp_int) || obj->is_type(_tp_float);
     }
 
-    inline bool isIntOrFloat(const PyVar& obj1, const PyVar& obj2){
-        return isIntOrFloat(obj1) && isIntOrFloat(obj2);
+    inline bool is_number(PyWeakRef obj1, PyWeakRef obj2) const noexcept{
+        return is_number(obj1) && is_number(obj2);
     }
 
     inline _Float numToFloat(const PyVar& obj){
@@ -818,7 +811,7 @@ public:
         _StrStream ss;
         int prev_line = -1;
         for(int i=0; i<code->co_code.size(); i++){
-            const ByteCode& byte = code->co_code[i];
+            const Bytecode& byte = code->co_code[i];
             _Str line = std::to_string(byte.line);
             if(byte.line == prev_line) line = "";
             else{
@@ -868,21 +861,21 @@ public:
     PyVar _tp_super, _tp_exception;
 
     template<typename P>
-    inline PyVarRef PyRef(P&& value) {
+    inline PyObject* PyRef(P&& value) {
         static_assert(std::is_base_of<BaseRef, P>::value, "P should derive from BaseRef");
-        return newObject(_tp_ref, std::forward<P>(value));
+        return new_object(_tp_ref, std::forward<P>(value));
     }
 
-    inline const BaseRef* PyRef_AS_C(const PyVar& obj)
+    inline const BaseRef* PyRef_AS_C(PyWeakRef obj)
     {
-        if(!obj->isType(_tp_ref)) typeError("expected an l-value");
+        if(!obj->is_type(_tp_ref)) typeError("expected an l-value");
         return (const BaseRef*)(obj->value());
     }
 
     __DEF_PY_AS_C(Int, _Int, _tp_int)
-    inline PyVar PyInt(_Int value) { 
+    inline PyObject* PyInt(_Int value) { 
         if(value >= -5 && value <= 256) return _smallIntegers[value + 5];
-        return newObject(_tp_int, value);
+        return new_object(_tp_int, value);
     }
 
     DEF_NATIVE(Float, _Float, _tp_float)
@@ -936,20 +929,20 @@ public:
         this->builtins = newModule("builtins");
         this->_main = newModule("__main__");
 
-        setAttr(_tp_type, __base__, _tp_object);
+        setattr(_tp_type, __base__, _tp_object);
         _tp_type->_type = _tp_type;
-        setAttr(_tp_object, __base__, None);
+        setattr(_tp_object, __base__, None);
         _tp_object->_type = _tp_type;
         
         for (auto& [name, type] : _types) {
-            setAttr(type, __name__, PyStr(name));
+            setattr(type, __name__, PyStr(name));
         }
 
         this->__py2py_call_signal = newObject(_tp_object, (_Int)7);
 
         std::vector<_Str> publicTypes = {"type", "object", "bool", "int", "float", "str", "list", "tuple", "range"};
         for (auto& name : publicTypes) {
-            setAttr(builtins, name, _types[name]);
+            setattr(builtins, name, _types[name]);
         }
     }
 
@@ -981,7 +974,7 @@ private:
     void _raise_tos(){
         const PyVar& obj = topFrame()->__top();
         if(!obj->isType(_tp_exception)) UNREACHABLE();
-        std::cout << "throw PyRaiseEvent();" << std::endl;
+        // std::cout << "throw PyRaiseEvent();" << std::endl;
         throw PyRaiseEvent();
     }
 
@@ -1004,7 +997,6 @@ private:
 
 public:
     void typeError(const _Str& msg){ _error("TypeError", msg); }
-    void systemError(const _Str& msg){ _error("SystemError", msg); }
     void zeroDivisionError(){ _error("ZeroDivisionError", "division by zero"); }
     void indexError(const _Str& msg){ _error("IndexError", msg); }
     void valueError(const _Str& msg){ _error("ValueError", msg); }
@@ -1037,26 +1029,26 @@ public:
 
 /***** Pointers' Impl *****/
 
-PyVar NameRef::get(VM* vm, Frame* frame) const{
+PyObject* NameRef::get(VM* vm, Frame* frame) const{
     PyVar* val = frame->f_locals.try_get(pair->first);
-    if(val) return *val;
+    if(val) return (*val)->copy();
     val = frame->f_globals().try_get(pair->first);
-    if(val) return *val;
+    if(val) return (*val)->copy();
     val = vm->builtins->attribs.try_get(pair->first);
-    if(val) return *val;
+    if(val) return (*val)->copy();
     vm->nameError(pair->first);
     return nullptr;
 }
 
-void NameRef::set(VM* vm, Frame* frame, PyVar val) const{
+void NameRef::set(VM* vm, Frame* frame, PyObject* val) const{
     switch(pair->second) {
-        case NAME_LOCAL: frame->f_locals[pair->first] = std::move(val); break;
+        case NAME_LOCAL: frame->f_locals[pair->first] = val->share(); break;
         case NAME_GLOBAL:
         {
             if(frame->f_locals.count(pair->first) > 0){
-                frame->f_locals[pair->first] = std::move(val);
+                frame->f_locals[pair->first] = val->share();
             }else{
-                frame->f_globals()[pair->first] = std::move(val);
+                frame->f_globals()[pair->first] = val->share();
             }
         } break;
         default: UNREACHABLE();
@@ -1088,12 +1080,12 @@ void NameRef::del(VM* vm, Frame* frame) const{
     }
 }
 
-PyVar AttrRef::get(VM* vm, Frame* frame) const{
+PyObject* AttrRef::get(VM* vm, Frame* frame) const{
     return vm->getAttr(obj, attr.pair->first);
 }
 
 void AttrRef::set(VM* vm, Frame* frame, PyVar val) const{
-    vm->setAttr(obj, attr.pair->first, val);
+    vm->setattr(obj, attr.pair->first, val);
 }
 
 void AttrRef::del(VM* vm, Frame* frame) const{
@@ -1136,11 +1128,6 @@ void TupleRef::del(VM* vm, Frame* frame) const{
     for (auto& r : varRefs) vm->PyRef_AS_C(r)->del(vm, frame);
 }
 
-/***** Frame's Impl *****/
-inline PyVar Frame::__deref_pointer(VM* vm, PyVar v){
-    if(v->isType(vm->_tp_ref)) return vm->PyRef_AS_C(v)->get(vm, this);
-    return v;
-}
 
 /***** Iterators' Impl *****/
 PyVar RangeIterator::next(){

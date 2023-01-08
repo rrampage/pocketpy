@@ -67,19 +67,28 @@ public:
 typedef pkpy::shared_ptr<Function> _Func;
 typedef pkpy::shared_ptr<BaseIterator> _Iterator;
 
+typedef PyVar PyAutoRef;
+typedef PyObject* PyWeakRef;
+
 struct PyObject {
-    PyVar _type;
+    int ref_count;
+    PyAutoRef type;
     PyVarDict attribs;
 
-    inline bool isType(const PyVar& type){ return this->_type == type; }
-    inline virtual void* value() = 0;
+    PyObject(PyObject* type) : type(type) { ref_count = 1; }
 
-    // currently __name__ is only used for 'type'
-    PyVar _typeName(){ return _type->attribs[__name__]; }
+    inline void incref() { ref_count++; }
+    inline void decref() { if(--ref_count == 0) delete this; }
+    [[nodiscard]] inline PyObject* copy() { incref(); return this; }
+    [[nodiscard]] inline PyAutoRef share() { return PyAutoRef(this); }
 
-    PyObject(PyVar type) : _type(type) {}
+    inline bool is_type(const PyObject* type) const{ return this->type.get() == type; }
+    inline bool is_type(const PyAutoRef& type) const{ return this->type.get() == type.get(); }
+
+    virtual void* value() = 0;
     virtual ~PyObject() = default;
 };
+
 
 template <typename T>
 struct Py_ : PyObject {
@@ -89,6 +98,6 @@ struct Py_ : PyObject {
     virtual void* value() override { return &_valueT; }
 };
 
-#define UNION_GET(T, obj) (((Py_<T>*)((obj).get()))->_valueT)
-#define UNION_TP_NAME(obj) UNION_GET(_Str, (obj)->_typeName())
-#define UNION_NAME(obj) UNION_GET(_Str, (obj)->attribs[__name__])
+#define UNION_GET(T, obj) (( (Py_<T>*)(obj) )->_valueT)
+#define UNION_NAME(obj) UNION_GET(_Str, (obj)->attribs[__name__].get())
+#define UNION_TP_NAME(obj) UNION_NAME((obj)->type)

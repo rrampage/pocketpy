@@ -5,4 +5,4 @@ try:
 except IndexError:
     c = 666
 
-print(c)
+assert c == 666
